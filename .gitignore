@@ -1,0 +1,20 @@
+# Secrets -- never commit
+.env
+terraform.tfvars
+*.pem
+*.key
+
+# Terraform local state and provider cache -- never commit
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# NOTE: .terraform.lock.hcl is intentionally NOT ignored -- commit it for
+# reproducible provider versions across machines.
+
+# OS/editor/office junk
+.DS_Store
+~$*
+
+# Scratch/debug files
+terraform/tmp

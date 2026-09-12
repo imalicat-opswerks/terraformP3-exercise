@@ -1,0 +1,17 @@
+[Unit]
+Description=Terraform P2-P3 Pre-Assessment Flask Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tfapp
+Group=tfapp
+EnvironmentFile=/etc/tf-preassessment/env
+WorkingDirectory=/opt/tf-preassessment/app
+ExecStart=/opt/tf-preassessment/venv/bin/gunicorn --workers 2 --bind 0.0.0.0:8088 app:app
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

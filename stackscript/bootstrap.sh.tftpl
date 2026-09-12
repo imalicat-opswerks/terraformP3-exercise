@@ -1,0 +1,139 @@
+#!/bin/bash
+# <UDF name="DB_HOST" label="Managed MySQL host" />
+# <UDF name="DB_PORT" label="Managed MySQL port" default="3306" />
+# <UDF name="DB_USER" label="Managed MySQL user" />
+# <UDF name="DB_PASSWORD" label="Managed MySQL password" />
+# <UDF name="DB_NAME" label="Application database name" default="tfpreassessment" />
+# <UDF name="OBJ_ACCESS_KEY" label="Object Storage access key" />
+# <UDF name="OBJ_SECRET_KEY" label="Object Storage secret key" />
+# <UDF name="OBJ_BUCKET" label="Object Storage bucket" />
+# <UDF name="OBJ_REGION" label="Object Storage region" />
+# <UDF name="ENGINEER_SLUG" label="Engineer slug" />
+# <UDF name="TFAPP_USER" label="App service system user" default="tfapp" />
+
+set -euo pipefail
+exec > >(tee -a /var/log/tf-preassessment-bootstrap.log) 2>&1
+echo "== tf-preassessment bootstrap starting $(date -u) =="
+
+# --- OS updates ---------------------------------------------------------
+dnf -y update
+
+# --- SELinux disabled ----------------------------------------------------
+setenforce 0 || true
+sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
+
+# --- Packages --------------------------------------------------------------
+dnf -y install epel-release
+dnf -y install python3 python3-pip nginx mariadb cronie openssl policycoreutils shadow-utils
+systemctl disable --now firewalld 2>/dev/null || true
+
+# --- Users -----------------------------------------------------------------
+id -u "$TFAPP_USER" &>/dev/null || useradd -m -s /sbin/nologin "$TFAPP_USER"
+
+if [ -n "$ENGINEER_SLUG" ] && ! id -u "$ENGINEER_SLUG" &>/dev/null; then
+  useradd -m -s /bin/bash -G wheel "$ENGINEER_SLUG"
+  install -d -m 700 -o "$ENGINEER_SLUG" -g "$ENGINEER_SLUG" "/home/$ENGINEER_SLUG/.ssh"
+  if [ -f /root/.ssh/authorized_keys ]; then
+    cp /root/.ssh/authorized_keys "/home/$ENGINEER_SLUG/.ssh/authorized_keys"
+    chown "$ENGINEER_SLUG:$ENGINEER_SLUG" "/home/$ENGINEER_SLUG/.ssh/authorized_keys"
+    chmod 600 "/home/$ENGINEER_SLUG/.ssh/authorized_keys"
+  fi
+  # No root_pass on this instance, so this account has no password either --
+  # passwordless sudo is the only way in to run privileged commands.
+  echo "$ENGINEER_SLUG ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/90-$ENGINEER_SLUG"
+  chmod 440 "/etc/sudoers.d/90-$ENGINEER_SLUG"
+  visudo -c
+fi
+
+# --- SSH hardening: keys only, no root login --------------------------------
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+sed -i 's/^#\?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config
+systemctl restart sshd
+
+# --- App/site directories ---------------------------------------------------
+install -d -m 755 /opt/tf-preassessment/app
+install -d -m 755 /opt/tf-preassessment/site
+install -d -m 750 /etc/tf-preassessment
+
+# --- Environment file for the systemd service and sync job ------------------
+cat > /etc/tf-preassessment/env <<EOF
+DB_HOST=$DB_HOST
+DB_PORT=$DB_PORT
+DB_USER=$DB_USER
+DB_PASSWORD=$DB_PASSWORD
+DB_NAME=$DB_NAME
+DB_CA_CERT=/etc/tf-preassessment/ca-cert.pem
+OBJ_ACCESS_KEY=$OBJ_ACCESS_KEY
+OBJ_SECRET_KEY=$OBJ_SECRET_KEY
+OBJ_BUCKET=$OBJ_BUCKET
+OBJ_REGION=$OBJ_REGION
+ENGINEER_SLUG=$ENGINEER_SLUG
+SITE_DIR=/opt/tf-preassessment/site
+EOF
+chown root:"$TFAPP_USER" /etc/tf-preassessment/env
+chmod 640 /etc/tf-preassessment/env
+
+# --- Database CA certificate --------------------------------------------------
+# Already a complete PEM certificate -- not base64 to decode.
+cat > /etc/tf-preassessment/ca-cert.pem <<'CACERT_EOF'
+${db_ca_cert_pem}
+CACERT_EOF
+chmod 644 /etc/tf-preassessment/ca-cert.pem
+
+# --- Embedded application files ---------------------------------------------
+base64 -di <<'B64_APP_PY' > /opt/tf-preassessment/app/app.py
+${app_py_b64}
+B64_APP_PY
+
+base64 -di <<'B64_REQUIREMENTS' > /opt/tf-preassessment/app/requirements.txt
+${requirements_b64}
+B64_REQUIREMENTS
+
+base64 -di <<'B64_SYNC' > /usr/local/bin/sync-site.py
+${sync_site_b64}
+B64_SYNC
+chmod 755 /usr/local/bin/sync-site.py
+
+base64 -di <<'B64_SERVICE' > /etc/systemd/system/tf-preassessment.service
+${service_unit_b64}
+B64_SERVICE
+
+base64 -di <<'B64_NGINX' > /etc/nginx/conf.d/tf-preassessment.conf
+${nginx_conf_b64}
+B64_NGINX
+rm -f /etc/nginx/conf.d/default.conf 2>/dev/null || true
+
+# --- Python virtualenv -------------------------------------------------------
+python3 -m venv /opt/tf-preassessment/venv
+/opt/tf-preassessment/venv/bin/pip install --upgrade pip
+/opt/tf-preassessment/venv/bin/pip install -r /opt/tf-preassessment/app/requirements.txt
+
+chown -R "$TFAPP_USER:$TFAPP_USER" /opt/tf-preassessment
+
+# --- Self-signed TLS certificate --------------------------------------------
+install -d -m 755 /etc/pki/tls/private
+openssl req -x509 -nodes -days 825 -newkey rsa:2048 \
+  -keyout /etc/pki/tls/private/tf-preassessment.key \
+  -out /etc/pki/tls/certs/tf-preassessment.crt \
+  -subj "/CN=$ENGINEER_SLUG.tfp3.local"
+chmod 600 /etc/pki/tls/private/tf-preassessment.key
+
+# --- Start services -----------------------------------------------------------
+systemctl daemon-reload
+systemctl enable --now tf-preassessment.service
+systemctl enable --now nginx
+nginx -t && systemctl reload nginx
+
+# --- Initial site sync + cron every 5 minutes --------------------------------
+# sync-site.py reads the env file itself instead of being shell-sourced, so
+# secrets containing $ or backticks can't be re-interpreted by bash.
+/opt/tf-preassessment/venv/bin/python3 /usr/local/bin/sync-site.py || true
+
+cat > /etc/cron.d/tf-preassessment-sync <<'CRON'
+*/5 * * * * root /opt/tf-preassessment/venv/bin/python3 /usr/local/bin/sync-site.py >> /var/log/tf-preassessment-sync.log 2>&1
+CRON
+chmod 644 /etc/cron.d/tf-preassessment-sync
+systemctl enable --now crond
+
+echo "== tf-preassessment bootstrap complete $(date -u) =="

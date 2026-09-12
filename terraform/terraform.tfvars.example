@@ -1,0 +1,8 @@
+engineer_slug = "juan-dela-cruz"
+region        = "us-mia"
+
+ssh_public_key = "ssh-ed25519 AAAA... you@yourhost"
+
+shared_firewall_id   = 123456
+shared_bucket_label  = "tfp3-shared-bucket"
+shared_bucket_region = "us-mia-1"
